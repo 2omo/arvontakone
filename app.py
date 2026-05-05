@@ -1,9 +1,10 @@
 import os
-import random
+import re
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from playwright.sync_api import sync_playwright
+import uvicorn
 
 app = FastAPI()
 
@@ -18,19 +19,74 @@ def lue_pelaajat():
 
     df.columns = df.columns.str.strip()
 
-    print("SARAKKEET:", df.columns.tolist())
-
     if "Rooli" not in df.columns:
         raise ValueError(f"CSV-tiedostosta puuttuu Rooli-sarake. Sarakkeet: {df.columns.tolist()}")
 
     df["Rooli"] = df["Rooli"].astype(str).str.strip().str.upper()
-
     return df
 
 
+def hae_nimenhuuto_ilmoittautuneet(event_url):
+    user = os.environ.get("NIMENHUUTO_USER")
+    password = os.environ.get("NIMENHUUTO_PASS")
+
+    if not user or not password:
+        raise ValueError("NIMENHUUTO_USER tai NIMENHUUTO_PASS puuttuu Renderin Environment Variables -asetuksista.")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = browser.new_page()
+
+        page.goto(event_url, wait_until="networkidle")
+
+        if "login" in page.url or "sign" in page.url:
+            page.fill('input[type="email"], input[name="email"], input[name="login"]', user)
+            page.fill('input[type="password"], input[name="password"]', password)
+            page.click('button[type="submit"], input[type="submit"]')
+            page.wait_for_load_state("networkidle")
+            page.goto(event_url, wait_until="networkidle")
+
+        text = page.inner_text("body")
+        browser.close()
+
+    # Yritetään löytää IN-osio ja katkaista OUT-/MAYBE-osioon.
+    match = re.search(r"(IN|Tulossa)(.*?)(OUT|Ei tulossa|MAYBE|Ehkä|Kommentit|Comments)", text, re.S | re.I)
+
+    if not match:
+        raise ValueError("Ilmoittautuneita ei löytynyt Nimenhuuto-sivulta. Sivun rakenne pitää tarkistaa.")
+
+    in_text = match.group(2)
+
+    nimet = []
+    for line in in_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Poistetaan yleisiä häiriöitä.
+        if line.lower() in ["in", "out", "maybe", "tulossa", "ei tulossa", "ehkä"]:
+            continue
+        if len(line) < 2:
+            continue
+        if any(x in line.lower() for x in ["ilmoittaudu", "kommentti", "pelaajaa", "osallistujat"]):
+            continue
+
+        nimet.append(line)
+
+    # Poistetaan duplikaatit järjestys säilyttäen.
+    unique = []
+    for n in nimet:
+        if n not in unique:
+            unique.append(n)
+
+    return unique
+
+
+def normalisoi_nimi(n):
+    return str(n).strip().lower()
+
+
 def numero(rivi, sarake):
-    if sarake not in rivi:
-        return 0
     value = pd.to_numeric(rivi.get(sarake, 0), errors="coerce")
     if pd.isna(value):
         return 0
@@ -41,10 +97,7 @@ def laske_arvo(r):
     rooli = str(r["Rooli"]).strip().upper()
 
     if rooli == "G":
-        return (
-            0.6 * numero(r, "Torjuntataito")
-            + 0.4 * numero(r, "Liike")
-        )
+        return 0.6 * numero(r, "Torjuntataito") + 0.4 * numero(r, "Liike")
 
     return (
         0.25 * numero(r, "Kiekollinen taito")
@@ -57,36 +110,17 @@ def laske_arvo(r):
 
 def rooli_nimi(rooli):
     rooli = str(rooli).strip().upper()
-    if rooli == "O":
-        return "Hyökkääjä"
-    if rooli == "D":
-        return "Puolustaja"
-    if rooli == "G":
-        return "Maalivahti"
-    return rooli
+    return {"O": "Hyökkääjä", "D": "Puolustaja", "G": "Maalivahti"}.get(rooli, rooli)
 
 
 def arvioi(j1, j2):
-    score = 0
+    score = 10 * abs(j1["arvo"].sum() - j2["arvo"].sum())
 
-    # Kokonaisarvon ero
-    score += 10 * abs(j1["arvo"].sum() - j2["arvo"].sum())
-
-    # Roolitasapaino
     for rooli in ["O", "D"]:
         score += 5 * abs((j1["Rooli"] == rooli).sum() - (j2["Rooli"] == rooli).sum())
 
-    # Taitokohtainen tasapaino
-    sarakkeet = [
-        "Kiekollinen taito",
-        "Luistelutaito",
-        "Kamppailutaito",
-        "Laukauksen laatu",
-        "Joukkuepelaaminen",
-    ]
-
-    for sarake in sarakkeet:
-        if sarake in j1.columns and sarake in j2.columns:
+    for sarake in ["Kiekollinen taito", "Luistelutaito", "Kamppailutaito", "Laukauksen laatu", "Joukkuepelaaminen"]:
+        if sarake in j1.columns:
             score += 2 * abs(
                 pd.to_numeric(j1[sarake], errors="coerce").fillna(0).sum()
                 - pd.to_numeric(j2[sarake], errors="coerce").fillna(0).sum()
@@ -101,8 +135,8 @@ def jaa_kenttapelaajat(kentta, iterations=20000):
 
     for _ in range(iterations):
         shuffled = kentta.sample(frac=1).reset_index(drop=True)
-
         mid = len(shuffled) // 2
+
         j1 = shuffled.iloc[:mid].copy()
         j2 = shuffled.iloc[mid:].copy()
 
@@ -117,22 +151,35 @@ def jaa_kenttapelaajat(kentta, iterations=20000):
 
 def jaa_maalivahdit(mv):
     if len(mv) < 2:
-        raise ValueError("Arvonta vaatii vähintään kaksi maalivahtia, koska maalivahdit jaetaan eri joukkueisiin.")
+        raise ValueError("Arvonta vaatii vähintään kaksi ilmoittautunutta maalivahtia.")
 
     mv = mv.sample(frac=1).reset_index(drop=True)
-
-    j1_mv = mv.iloc[[0]].copy()
-    j2_mv = mv.iloc[[1]].copy()
-
-    return j1_mv, j2_mv
+    return mv.iloc[[0]].copy(), mv.iloc[[1]].copy()
 
 
-def arvo_joukkueet():
+def arvo_joukkueet(event_url):
+    ilmoittautuneet = hae_nimenhuuto_ilmoittautuneet(event_url)
+
     df = lue_pelaajat()
-    df["arvo"] = df.apply(laske_arvo, axis=1)
 
-    mv = df[df["Rooli"] == "G"].copy()
-    kentta = df[df["Rooli"] != "G"].copy()
+    if "Nimi" not in df.columns:
+        raise ValueError("CSV-tiedostosta puuttuu Nimi-sarake.")
+
+    df["_nimi_norm"] = df["Nimi"].apply(normalisoi_nimi)
+    ilmo_norm = [normalisoi_nimi(n) for n in ilmoittautuneet]
+
+    mukana = df[df["_nimi_norm"].isin(ilmo_norm)].copy()
+
+    loytyneet_norm = set(mukana["_nimi_norm"].tolist())
+    puuttuvat = [n for n in ilmoittautuneet if normalisoi_nimi(n) not in loytyneet_norm]
+
+    if len(mukana) < 4:
+        raise ValueError(f"Liian vähän CSV:stä löytyneitä ilmoittautuneita. Löytyi {len(mukana)}. Puuttuvat: {puuttuvat}")
+
+    mukana["arvo"] = mukana.apply(laske_arvo, axis=1)
+
+    mv = mukana[mukana["Rooli"] == "G"].copy()
+    kentta = mukana[mukana["Rooli"] != "G"].copy()
 
     j1_mv, j2_mv = jaa_maalivahdit(mv)
     (j1_k, j2_k), score = jaa_kenttapelaajat(kentta)
@@ -140,22 +187,18 @@ def arvo_joukkueet():
     j1 = pd.concat([j1_mv, j1_k]).reset_index(drop=True)
     j2 = pd.concat([j2_mv, j2_k]).reset_index(drop=True)
 
-    return j1, j2, score
+    return j1, j2, score, ilmoittautuneet, puuttuvat
 
 
 def joukkue_html(title, team):
     rows = ""
 
     for _, r in team.iterrows():
-        nimi = r.get("Nimi", r.iloc[0])
-        rooli = rooli_nimi(r["Rooli"])
-        arvo = round(r["arvo"], 2)
-
         rows += f"""
         <tr>
-            <td>{nimi}</td>
-            <td>{rooli}</td>
-            <td>{arvo}</td>
+            <td>{r.get("Nimi", "")}</td>
+            <td>{rooli_nimi(r["Rooli"])}</td>
+            <td>{r["arvo"]:.2f}</td>
         </tr>
         """
 
@@ -164,14 +207,8 @@ def joukkue_html(title, team):
         <h2>{title}</h2>
         <div class="total">Kokonaisarvo: {team["arvo"].sum():.2f}</div>
         <table>
-            <thead>
-                <tr>
-                    <th>Nimi</th>
-                    <th>Rooli</th>
-                    <th>Arvo</th>
-                </tr>
-            </thead>
-            <tbody>{rows}</tbody>
+            <tr><th>Nimi</th><th>Rooli</th><th>Arvo</th></tr>
+            {rows}
         </table>
     </div>
     """
@@ -180,100 +217,28 @@ def joukkue_html(title, team):
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-    <!doctype html>
-    <html lang="fi">
+    <html>
     <head>
         <meta charset="utf-8">
         <title>Arvontakone</title>
         <style>
-            body {
-                font-family: Arial, sans-serif;
-                background: #0f172a;
-                color: #e5e7eb;
-                margin: 0;
-                padding: 40px;
-            }
-            .container {
-                max-width: 1100px;
-                margin: auto;
-            }
-            h1 {
-                font-size: 42px;
-                margin-bottom: 10px;
-            }
-            p {
-                color: #cbd5e1;
-            }
-            button {
-                background: #38bdf8;
-                color: #020617;
-                border: none;
-                padding: 14px 24px;
-                border-radius: 10px;
-                font-size: 18px;
-                font-weight: bold;
-                cursor: pointer;
-                margin: 20px 0;
-            }
-            button:hover {
-                background: #7dd3fc;
-            }
-            .teams {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 24px;
-                margin-top: 24px;
-            }
-            .card {
-                background: #1e293b;
-                border-radius: 18px;
-                padding: 24px;
-                box-shadow: 0 12px 30px rgba(0,0,0,0.35);
-            }
-            .total {
-                margin-bottom: 16px;
-                color: #93c5fd;
-                font-weight: bold;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-            th, td {
-                padding: 10px;
-                border-bottom: 1px solid #334155;
-                text-align: left;
-            }
-            th {
-                color: #bfdbfe;
-            }
-            .score {
-                margin-top: 20px;
-                color: #a7f3d0;
-                font-weight: bold;
-            }
-            .error {
-                background: #7f1d1d;
-                color: #fee2e2;
-                padding: 16px;
-                border-radius: 10px;
-                margin-top: 20px;
-            }
-            @media (max-width: 800px) {
-                .teams {
-                    grid-template-columns: 1fr;
-                }
-            }
+            body { font-family: Arial; background:#0f172a; color:#e5e7eb; padding:40px; }
+            .container { max-width:900px; margin:auto; }
+            input { width:100%; padding:14px; border-radius:10px; border:0; font-size:16px; }
+            button { margin-top:18px; padding:14px 24px; border:0; border-radius:10px; background:#38bdf8; font-weight:bold; cursor:pointer; }
+            .card { background:#1e293b; padding:24px; border-radius:18px; margin-top:20px; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>🏒 Arvontakone</h1>
-            <p>Arpoo kaksi tasaväkistä joukkuetta pelaajataulukon perusteella.</p>
-
-            <form method="post" action="/arvo">
-                <button type="submit">Arvo joukkueet</button>
-            </form>
+            <div class="card">
+                <form method="post" action="/arvo">
+                    <label>Nimenhuuto-tapahtuman URL</label><br><br>
+                    <input name="event_url" placeholder="https://claybay.nimenhuuto.com/events/20044352" required>
+                    <button type="submit">Hae ilmoittautuneet ja arvo joukkueet</button>
+                </form>
+            </div>
         </div>
     </body>
     </html>
@@ -281,85 +246,45 @@ def home():
 
 
 @app.post("/arvo", response_class=HTMLResponse)
-def arvo():
+def arvo(event_url: str = Form(...)):
     try:
-        j1, j2, score = arvo_joukkueet()
+        j1, j2, score, ilmoittautuneet, puuttuvat = arvo_joukkueet(event_url)
+
+        puuttuvat_html = ""
+        if puuttuvat:
+            puuttuvat_html = "<h3>CSV:stä puuttuvat ilmoittautuneet</h3><ul>" + "".join(f"<li>{n}</li>" for n in puuttuvat) + "</ul>"
 
         return f"""
-        <!doctype html>
-        <html lang="fi">
+        <html>
         <head>
             <meta charset="utf-8">
-            <title>Arvontakone</title>
+            <title>Joukkuejako</title>
             <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    background: #0f172a;
-                    color: #e5e7eb;
-                    margin: 0;
-                    padding: 40px;
-                }}
-                .container {{
-                    max-width: 1200px;
-                    margin: auto;
-                }}
-                a {{
-                    color: #38bdf8;
-                    text-decoration: none;
-                    font-weight: bold;
-                }}
-                .teams {{
-                    display: grid;
-                    grid-template-columns: 1fr 1fr;
-                    gap: 24px;
-                    margin-top: 24px;
-                }}
-                .card {{
-                    background: #1e293b;
-                    border-radius: 18px;
-                    padding: 24px;
-                    box-shadow: 0 12px 30px rgba(0,0,0,0.35);
-                }}
-                .total {{
-                    margin-bottom: 16px;
-                    color: #93c5fd;
-                    font-weight: bold;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th, td {{
-                    padding: 10px;
-                    border-bottom: 1px solid #334155;
-                    text-align: left;
-                }}
-                th {{
-                    color: #bfdbfe;
-                }}
-                .score {{
-                    margin-top: 20px;
-                    color: #a7f3d0;
-                    font-weight: bold;
-                }}
-                @media (max-width: 800px) {{
-                    .teams {{
-                        grid-template-columns: 1fr;
-                    }}
-                }}
+                body {{ font-family: Arial; background:#0f172a; color:#e5e7eb; padding:40px; }}
+                .container {{ max-width:1200px; margin:auto; }}
+                .teams {{ display:grid; grid-template-columns:1fr 1fr; gap:24px; }}
+                .card {{ background:#1e293b; padding:24px; border-radius:18px; }}
+                table {{ width:100%; border-collapse:collapse; }}
+                th, td {{ padding:10px; border-bottom:1px solid #334155; text-align:left; }}
+                th {{ color:#bfdbfe; }}
+                .total {{ color:#93c5fd; font-weight:bold; margin-bottom:12px; }}
+                a {{ color:#38bdf8; }}
+                .note {{ margin-top:20px; color:#a7f3d0; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>🏒 Joukkuejako</h1>
-                <a href="/">← Arvo uudestaan</a>
+                <p><a href="/">← Takaisin</a></p>
 
                 <div class="teams">
                     {joukkue_html("Joukkue 1", j1)}
                     {joukkue_html("Joukkue 2", j2)}
                 </div>
 
-                <div class="score">Tasapainopisteet: {score:.2f}</div>
+                <div class="note">Tasapainopisteet: {score:.2f}</div>
+                <div class="note">Nimenhuudosta löytyi {len(ilmoittautuneet)} ilmoittautunutta.</div>
+                {puuttuvat_html}
             </div>
         </body>
         </html>
@@ -367,15 +292,10 @@ def arvo():
 
     except Exception as e:
         return f"""
-        <!doctype html>
-        <html lang="fi">
-        <head>
-            <meta charset="utf-8">
-            <title>Virhe</title>
-        </head>
-        <body style="font-family: Arial; background:#0f172a; color:#e5e7eb; padding:40px;">
-            <h1>Virhe arvonnassa</h1>
-            <div style="background:#7f1d1d; color:#fee2e2; padding:16px; border-radius:10px;">
+        <html>
+        <body style="font-family:Arial; background:#0f172a; color:#e5e7eb; padding:40px;">
+            <h1>Virhe</h1>
+            <div style="background:#7f1d1d; color:#fee2e2; padding:20px; border-radius:10px;">
                 {str(e)}
             </div>
             <p><a style="color:#38bdf8;" href="/">Takaisin</a></p>
@@ -385,7 +305,5 @@ def arvo():
 
 
 if __name__ == "__main__":
-    import uvicorn
-
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
