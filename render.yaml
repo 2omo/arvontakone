@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: arvontakone
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: NIMENHUUTO_EMAIL
+        sync: false
+      - key: NIMENHUUTO_PASSWORD
+        sync: false
