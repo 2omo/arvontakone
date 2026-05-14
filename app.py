@@ -39,48 +39,98 @@ def hae_nimenhuuto_ilmoittautuneet(event_url):
 
         page.goto(event_url, wait_until="networkidle")
 
-        if "login" in page.url or "sign" in page.url:
-            page.fill('input[type="email"], input[name="email"], input[name="login"]', user)
-            page.fill('input[type="password"], input[name="password"]', password)
-            page.click('button[type="submit"], input[type="submit"]')
+        # Jos ohjautui kirjautumiseen
+        if "sessions/new" in page.url or "login" in page.url:
+            inputs = page.locator("input").evaluate_all(
+                """els => els.map(e => ({
+                    type: e.type,
+                    name: e.name,
+                    id: e.id,
+                    placeholder: e.placeholder
+                }))"""
+            )
+            print("LOGIN INPUTS:", inputs)
+
+            page.locator('input[type="email"], input[name*="email"], input[name*="login"], input[type="text"]').first.fill(user)
+            page.locator('input[type="password"]').first.fill(password)
+            page.locator('button[type="submit"], input[type="submit"]').first.click()
+
             page.wait_for_load_state("networkidle")
             page.goto(event_url, wait_until="networkidle")
 
+        print("FINAL URL:", page.url)
+        title = page.title()
         text = page.inner_text("body")
+
+        print("PAGE TITLE:", title)
+        print("PAGE TEXT START:")
+        print(text[:5000])
+        print("PAGE TEXT END")
+
         browser.close()
 
-    # Yritetään löytää IN-osio ja katkaista OUT-/MAYBE-osioon.
-    match = re.search(r"(IN|Tulossa)(.*?)(OUT|Ei tulossa|MAYBE|Ehkä|Kommentit|Comments)", text, re.S | re.I)
+    # Debug: jos ollaan yhä kirjautumissivulla
+    if "Kirjaudu jäsensivuille" in text or "Palvelun käyttö edellyttää evästeiden" in text:
+        raise ValueError(
+            "Nimenhuuto-kirjautuminen ei onnistunut. Tarkista Renderin NIMENHUUTO_USER ja NIMENHUUTO_PASS. "
+            "Jos käytät Google-kirjautumista, tarvitsemme erillisen Nimenhuuto-salasanakirjautumisen."
+        )
 
-    if not match:
-        raise ValueError("Ilmoittautuneita ei löytynyt Nimenhuuto-sivulta. Sivun rakenne pitää tarkistaa.")
+    # Ensimmäinen yritys: etsi rivit IN/Tulossa-osion ympäriltä
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    in_text = match.group(2)
+    print("LINES:", lines[:200])
+
+    in_keywords = ["IN", "Tulossa", "Osallistuu"]
+    out_keywords = ["OUT", "Ei tulossa", "MAYBE", "Ehkä", "Kommentit", "Comments"]
+
+    start = None
+    end = None
+
+    for i, line in enumerate(lines):
+        if line in in_keywords:
+            start = i + 1
+            break
+
+    if start is not None:
+        for j in range(start, len(lines)):
+            if lines[j] in out_keywords:
+                end = j
+                break
+
+        candidate_lines = lines[start:end] if end else lines[start:]
+    else:
+        candidate_lines = []
 
     nimet = []
-    for line in in_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # Poistetaan yleisiä häiriöitä.
-        if line.lower() in ["in", "out", "maybe", "tulossa", "ei tulossa", "ehkä"]:
-            continue
+    for line in candidate_lines:
         if len(line) < 2:
             continue
-        if any(x in line.lower() for x in ["ilmoittaudu", "kommentti", "pelaajaa", "osallistujat"]):
+        if any(x in line.lower() for x in [
+            "ilmoittaudu",
+            "kommentti",
+            "pelaajaa",
+            "osallistujat",
+            "muokkaa",
+            "poista",
+            "takaisin",
+            "valikko",
+        ]):
             continue
-
         nimet.append(line)
 
-    # Poistetaan duplikaatit järjestys säilyttäen.
     unique = []
     for n in nimet:
         if n not in unique:
             unique.append(n)
 
-    return unique
+    if not unique:
+        raise ValueError(
+            "Ilmoittautuneita ei löytynyt Nimenhuuto-sivulta. "
+            "Katso Renderin logeista kohdat PAGE TEXT START ja LINES ja lähetä ne tänne."
+        )
 
+    return unique
 
 def normalisoi_nimi(n):
     return str(n).strip().lower()
