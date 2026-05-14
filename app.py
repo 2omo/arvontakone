@@ -39,47 +39,49 @@ def hae_nimenhuuto_ilmoittautuneet(event_url):
 
         page.goto(event_url, wait_until="networkidle")
 
-        # Jos ohjautui kirjautumiseen
         if "sessions/new" in page.url or "login" in page.url:
-            inputs = page.locator("input").evaluate_all(
-                """els => els.map(e => ({
-                    type: e.type,
-                    name: e.name,
-                    id: e.id,
-                    placeholder: e.placeholder
-                }))"""
-            )
-            print("LOGIN INPUTS:", inputs)
+            page.wait_for_timeout(1000)
 
-            page.locator('input[type="email"], input[name*="email"], input[name*="login"], input[type="text"]').first.fill(user)
-            page.locator('input[type="password"]').first.fill(password)
-            page.locator('button[type="submit"], input[type="submit"]').first.click()
+            print("LOGIN URL:", page.url, flush=True)
+            print("LOGIN TITLE:", page.title(), flush=True)
+
+            visible_inputs = page.locator("input:visible")
+            count = visible_inputs.count()
+
+            print("VISIBLE INPUT COUNT:", count, flush=True)
+
+            if count < 2:
+                raise ValueError("Kirjautumissivulta ei löytynyt näkyviä käyttäjätunnus- ja salasanakenttiä.")
+
+            username_input = visible_inputs.nth(0)
+            password_input = page.locator('input[type="password"]:visible').first
+
+            username_input.fill(user)
+            password_input.fill(password)
+
+            page.locator('button:visible, input[type="submit"]:visible').last.click()
 
             page.wait_for_load_state("networkidle")
             page.goto(event_url, wait_until="networkidle")
 
-        print("FINAL URL:", page.url)
-        title = page.title()
         text = page.inner_text("body")
 
-        print("PAGE TITLE:", title)
-        print("PAGE TEXT START:")
-        print(text[:5000])
-        print("PAGE TEXT END")
+        print("FINAL URL:", page.url, flush=True)
+        print("PAGE TITLE:", page.title(), flush=True)
+        print("PAGE TEXT START:", flush=True)
+        print(text[:5000], flush=True)
+        print("PAGE TEXT END", flush=True)
 
         browser.close()
 
-    # Debug: jos ollaan yhä kirjautumissivulla
     if "Kirjaudu jäsensivuille" in text or "Palvelun käyttö edellyttää evästeiden" in text:
         raise ValueError(
-            "Nimenhuuto-kirjautuminen ei onnistunut. Tarkista Renderin NIMENHUUTO_USER ja NIMENHUUTO_PASS. "
-            "Jos käytät Google-kirjautumista, tarvitsemme erillisen Nimenhuuto-salasanakirjautumisen."
+            "Nimenhuuto-kirjautuminen ei onnistunut. Tarkista käyttäjätunnus ja salasana. "
+            "Jos käytät Google-kirjautumista, tarvitset Nimenhuutoon erillisen salasanakirjautumisen."
         )
 
-    # Ensimmäinen yritys: etsi rivit IN/Tulossa-osion ympäriltä
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    print("LINES:", lines[:200])
+    print("LINES:", lines[:200], flush=True)
 
     in_keywords = ["IN", "Tulossa", "Osallistuu"]
     out_keywords = ["OUT", "Ei tulossa", "MAYBE", "Ehkä", "Kommentit", "Comments"]
@@ -126,8 +128,7 @@ def hae_nimenhuuto_ilmoittautuneet(event_url):
 
     if not unique:
         raise ValueError(
-            "Ilmoittautuneita ei löytynyt Nimenhuuto-sivulta. "
-            "Katso Renderin logeista kohdat PAGE TEXT START ja LINES ja lähetä ne tänne."
+            "Ilmoittautuneita ei löytynyt Nimenhuuto-sivulta. Katso Renderin logeista PAGE TEXT START ja LINES."
         )
 
     return unique
